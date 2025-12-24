@@ -1,0 +1,19 @@
+1 Setup de Infraestructura: Crear docker-compose.yml con pgvector. Levantar el servicio.
+
+2 Script de Ingesta (ETL):
+
+    Leer PDFs (PyPDFLoader).
+
+    Limpiar texto y Chunking (RecursiveCharacterTextSplitter).
+
+    Embeddings (GoogleGenerativeAIEmbeddings).
+
+    Carga a Postgres (PGVector).
+
+3 Core RAG Module: Crear clase Python que encapsule la lógica get_answer(question).
+
+4 Unit Testing: Escribir tests con pytest para verificar que el módulo RAG conecta y recupera datos.
+
+5 Interfaz Gráfica: Crear app.py con Streamlit. Integrar historial de chat.
+
+6 Despliegue: Subir código a GitHub y conectar con Railway/Render.
