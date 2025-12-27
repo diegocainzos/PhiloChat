@@ -1,124 +1,122 @@
-"""
- Leer PDFs (PyPDFLoader).
-
-    Limpiar texto y Chunking (RecursiveCharacterTextSplitter).
-
-    Embeddings (GoogleGenerativeAIEmbeddings).
-
-    Carga a Postgres (PGVector).
-
-    ETL FULL TEXT
-"""
-import uuid
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document 
-from pathlib import Path
 import re
+import uuid
+import hashlib
+from pathlib import Path
 from rich import print
 from dotenv import load_dotenv
 
+# LangChain imports
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document 
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_postgres import PGVectorStore, PGEngine
+
 load_dotenv()
 
-# ... (Tus funciones e imports previos se mantienen igual) ...
-
-# CODE
-# Asumo que loaders es una lista de listas (una lista de páginas por cada libro)
-# Para este ejemplo procesamos el primer libro:
-# FUNCTIONS
-def book_processing(docs : list[Document], skip_n=5, min_length=100):
-    def clean(doc):
-        doc.metadata["id"] = str(uuid.uuid4())
-        # Nota la 'r' antes de las comillas del patrón
-        doc.page_content = ' '.join(re.sub(r'[-\d]', '', doc.page_content).split())
-        return doc
-
-    return [clean(d) for d in docs[skip_n:] if len(d.page_content) > min_length]
-    
-# CONSTANTS
+# --- CONFIG ---
 FOLDER_PATH = Path('etl/sources/')
+CONNECTION_STRING = "postgresql+psycopg://langchain:langchain@localhost:6024/langchain"
+TABLE_NAME = "books"
+VECTOR_SIZE = 3072 
 
-# CODE
-file_routes = [str(file) for file in FOLDER_PATH.iterdir() if file.is_file()]
-
-docs = [PyPDFLoader(doc).load() for doc in file_routes]
-processed_doc_list = [book_processing(doc) for doc in docs]
-
-# --- PASO CRÍTICO: UNIFICACIÓN ---
-# 1. Unimos el texto de todas las páginas en un solo string gigante.
-# Usamos " " como separador para no pegar la última palabra de una pág con la primera de la otra.
-def unificacion(book_pages: list[Document]):
-    # Join all page contents with proper spacing
-    full_text = " ".join(page.page_content for page in book_pages)
+# --- 1. LIMPIEZA DE PÁGINAS ---
+def generate_uuid_from_content(content: str, source: str) -> str:
+    # 1. Crear un hash único del contenido
+    unique_string = content + source
+    hash_object = hashlib.md5(unique_string.encode())
     
-    full_text = re.sub(r'[\x00-\x1f\x7f-\x9f\xad]', '', full_text)  # Remove control characters
-    full_text = re.sub(r'\s+', ' ', full_text)  # Normalize multiple spaces/newlines
-    full_text = full_text.strip()  # Remove leading/trailing whitespace
-    # 2. (Opcional) Recuperamos los metadatos generales del libro (del primer doc)
-    # Nota: Perderás el número de página específico ('page': 9), pero ganarás continuidad.
-    book_metadata = book_pages[0].metadata
-    # Limpiamos metadatos específicos de página si existen para no confundir
-    if 'page' in book_metadata:
-        del book_metadata['page']
-    if 'page_label' in book_metadata:
-        del book_metadata['page_label']
+    # 2. Convertir el hash (32 chars hex) directamente a un UUID válido
+    # Esto crea un UUID determinista (siempre el mismo para el mismo texto)
+    return str(uuid.UUID(hex=hash_object.hexdigest()))
 
-    # 3. Creamos un único Documento gigante
-    full_doc = Document(page_content=full_text, metadata=book_metadata)
-    return full_doc
+def clean_page_content(text: str) -> str:
+    # Ojo: Tu regex original [-\d] elimina TODOS los números (años, cantidades). 
+    # Si eso es lo que quieres, déjalo, si no, usa r'\s+' para limpiar espacios.
+    text = re.sub(r'[-\d]', '', text) 
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
-full_document_list = [unificacion(doc) for doc in processed_doc_list]
-print(type(full_document_list), len(full_document_list))
+def process_and_unify_book(file_path: str, skip_n=5) -> Document:
+    """
+    Carga, limpia y unifica un PDF en un solo Documento gigante.
+    """
+    loader = PyPDFLoader(file_path)
+    pages = loader.load()
+    
+    # Saltamos las primeras N páginas (índices, portadas)
+    pages = pages[skip_n:]
+    
+    # Extraemos el texto limpio de todas las páginas
+    cleaned_texts = [clean_page_content(p.page_content) for p in pages]
+    
+    # Unimos con espacio para mantener continuidad entre salto de página
+    full_text = " ".join(cleaned_texts)
+    
+    # Gestión de Metadatos: Tomamos la fuente del primer doc y limpiamos basura
+    if not pages:
+        return None
+        
+    meta = pages[0].metadata.copy()
+    meta.pop('page', None)       # Borrar número de página
+    meta.pop('page_label', None) # Borrar etiquetas de página
+    
+    # Retornamos UN solo documento por libro
+    return Document(page_content=full_text, metadata=meta)
 
-# --- CHUNKING ---
+
+# --- 2. PIPELINE DE EJECUCIÓN ---
+
+# A. Carga y Unificación
+file_routes = [str(file) for file in FOLDER_PATH.iterdir() if file.is_file()]
+print(f"Procesando {len(file_routes)} libros...")
+
+# Creamos la lista de LIBROS (Documentos gigantes)
+raw_books = []
+for route in file_routes:
+    book_doc = process_and_unify_book(route)
+    if book_doc and len(book_doc.page_content) > 100: # Filtro mínimo
+        raw_books.append(book_doc)
+
+print(f"Libros unificados: {len(raw_books)}")
+
+# B. Chunking (Splitter)
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1500,
     chunk_overlap=200,
-    separators=["\n\n", "\n", ".", " ", ""] # Definir prioridades ayuda
+    separators=["\n\n", "\n", ".", " ", ""]
 )
 
-# Ahora split_documents recibe una lista con UN solo documento gigante y lo trocea
-fully_procesed_books = [text_splitter.split_documents([doc]) for doc in full_document_list]
+# AQUI LA MEJORA: Pasamos la lista de libros directamente.
+# El splitter devolverá una lista PLANA de todos los chunks de todos los libros.
+all_chunks = text_splitter.split_documents(raw_books)
 
+ids_para_insertar = []
+docs_para_insertar = []
 
-# VERIFICACIÓN
-def show_chunk(splits):
-    import random
-    i = random.randint(0,len(splits))
-    print(f"Total chunks generados: {len(splits)}")
-    print(f"Longitud del {i} chunk: {len(splits[i].page_content)}")
-    print(f"--- Muestra del {i} chunk ---")
-    print(splits[i].page_content)
-    print("--- Metadatos ---")
-    print(splits[i].metadata)
+for chunk in all_chunks:
+    # 1. Generar ID determinista
+    doc_id = generate_uuid_from_content(chunk.page_content, chunk.metadata.get('source', ''))
+    
+    # 2. (Opcional) Asignarlo al documento si usas versiones nuevas de LangChain
+    chunk.id = doc_id 
+    
+    docs_para_insertar.append(chunk)
+    ids_para_insertar.append(doc_id)
 
-#show_chunk(splits)
+print(f"Total chunks generados listos para insertar: {len(all_chunks)}")
 
-#EMBEDDINGS
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+# --- 3. INGESTIÓN A POSTGRES ---
 
 embeddings_model = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
-# PGVECTOR DB
-from langchain_postgres import PGVectorStore, PGEngine
-
-def create_engine_and_table(db_connection_url: str,table_name: str, vector_size: int):
-    engine = PGEngine.from_connection_string(url=db_connection_url)
-    engine.drop_table(table_name)
-
-    engine.init_vectorstore_table(
-        table_name=TABLE_NAME,
-        vector_size=VECTOR_SIZE,
-        metadata_columns=['author']
-    )
-    return engine
-
-CONNECTION_STRING = "postgresql+psycopg://langchain:langchain@localhost:6024/langchain"
-VECTOR_SIZE = 3072
-TABLE_NAME = "books"
-
-engine = create_engine_and_table(CONNECTION_STRING, TABLE_NAME, VECTOR_SIZE)
-
+# Inicialización de DB
+engine = PGEngine.from_connection_string(url=CONNECTION_STRING)
+engine.init_vectorstore_table(
+    table_name=TABLE_NAME,
+    vector_size=VECTOR_SIZE,
+    metadata_columns=['source', 'chunk_id'] # Definir columnas ayuda a filtrar luego
+)
 
 store = PGVectorStore.create_sync(
     engine=engine,
@@ -126,11 +124,14 @@ store = PGVectorStore.create_sync(
     embedding_service=embeddings_model,
 )
 
-for book in fully_procesed_books:
-    store.add_documents(book)
+BATCH_SIZE = 100
 
-# query = "Quien era Sisifo?"
-# docs = store.similarity_search(query)
-# print(docs)
+total_docs = len(docs_para_insertar)
 
-
+for i in range(0, total_docs, BATCH_SIZE):
+    batch_docs = docs_para_insertar[i : i + BATCH_SIZE] 
+    batch_ids = ids_para_insertar[i : i + BATCH_SIZE]
+    store.add_documents(documents=batch_docs, ids=batch_ids)
+    
+    print(f"Insertado lote {i} a {min(i + BATCH_SIZE, total_docs)}")
+print("¡Proceso ETL finalizado!")

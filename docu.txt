@@ -17,3 +17,7 @@
 5 Interfaz Gráfica: Crear app.py con Streamlit. Integrar historial de chat.
 
 6 Despliegue: Subir código a GitHub y conectar con Railway/Render.
+
+
+NOTAS:
+pgvectorstore.add_documents ya se encarga de añadir una prymary key a los chunks.
